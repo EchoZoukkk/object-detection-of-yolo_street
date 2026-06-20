@@ -1,1 +1,385 @@
+"""
+模型剪枝算法模块 - 纯手动替换模块版（修复 SPPF cv2 输入通道）
+"""
 
+import torch
+import torch.nn as nn
+
+
+def _get_important_channels(weight, n_keep, dim=0):
+    """
+    基于 L1 范数选择重要通道的索引
+    """
+    if n_keep <= 0:
+        return torch.tensor([], dtype=torch.long)
+
+    if dim == 0:
+        importance = weight.abs().sum(dim=(1, 2, 3)) if weight.dim() == 4 else weight.abs().sum(dim=1)
+    else:
+        importance = weight.abs().sum(dim=(0, 2, 3)) if weight.dim() == 4 else weight.abs().sum(dim=0)
+
+    n_keep = min(n_keep, len(importance))
+    _, indices = torch.topk(importance, n_keep)
+    return indices.sort()[0]
+
+
+def _replace_conv(conv, new_in_channels=None, new_out_channels=None, keep_in_indices=None, keep_out_indices=None):
+    """
+    创建一个新的 Conv2d 模块，替换旧的
+    """
+    old_weight = conv.weight.data
+
+    if keep_out_indices is not None:
+        new_out = len(keep_out_indices)
+    elif new_out_channels is not None:
+        new_out = new_out_channels
+    else:
+        new_out = old_weight.shape[0]
+
+    if keep_in_indices is not None:
+        new_in = len(keep_in_indices)
+    elif new_in_channels is not None:
+        new_in = new_in_channels
+    else:
+        new_in = old_weight.shape[1]
+
+    new_conv = nn.Conv2d(
+        new_in, new_out,
+        kernel_size=conv.kernel_size,
+        stride=conv.stride,
+        padding=conv.padding,
+        dilation=conv.dilation,
+        groups=conv.groups,
+        bias=(conv.bias is not None)
+    ).to(conv.weight.device)
+
+    with torch.no_grad():
+        weight = old_weight
+        if keep_out_indices is not None:
+            weight = weight[keep_out_indices]
+        if keep_in_indices is not None:
+            weight = weight[:, keep_in_indices]
+
+        # 复制权重
+        out_copy = min(weight.shape[0], new_out)
+        in_copy = min(weight.shape[1], new_in)
+        new_conv.weight.data[:out_copy, :in_copy] = weight[:out_copy, :in_copy]
+
+        if conv.bias is not None:
+            if keep_out_indices is not None:
+                new_conv.bias.copy_(conv.bias.data[keep_out_indices])
+            else:
+                new_conv.bias.copy_(conv.bias.data[:new_out])
+
+    return new_conv
+
+
+def _replace_bn(bn, new_features, keep_indices=None):
+    """
+    创建新的 BatchNorm2d 模块
+    """
+    new_bn = nn.BatchNorm2d(new_features).to(bn.weight.device)
+
+    with torch.no_grad():
+        if keep_indices is not None:
+            new_bn.weight.copy_(bn.weight.data[keep_indices])
+            new_bn.bias.copy_(bn.bias.data[keep_indices])
+            new_bn.running_mean.copy_(bn.running_mean[keep_indices])
+            new_bn.running_var.copy_(bn.running_var[keep_indices])
+        else:
+            new_bn.weight.fill_(1.0)
+            new_bn.bias.zero_()
+            new_bn.running_mean.zero_()
+            new_bn.running_var.fill_(1.0)
+
+    return new_bn
+
+
+def prune_conv_module(conv_module, pruning_ratio=0.3, expected_in_channels=None):
+    """
+    裁剪 YOLOv8 的 Conv 模块
+    返回新的输出通道数
+    """
+    conv = conv_module.conv
+    bn = conv_module.bn
+
+    old_out = conv.weight.shape[0]
+    old_in = conv.weight.shape[1]
+
+    new_out = int(old_out * (1 - pruning_ratio))
+    new_out = max(new_out, 8)
+    new_out = (new_out // 8) * 8
+    new_out = min(new_out, old_out)
+
+    if new_out >= old_out and (expected_in_channels is None or expected_in_channels == old_in):
+        return old_out
+
+    keep_out = None
+    if new_out < old_out:
+        keep_out = _get_important_channels(conv.weight.data, new_out, dim=0)
+
+    keep_in = None
+    if expected_in_channels is not None and expected_in_channels != old_in:
+        keep_in = _get_important_channels(conv.weight.data, expected_in_channels, dim=1)
+
+    new_conv = _replace_conv(conv,
+                             new_out_channels=new_out if new_out < old_out else None,
+                             new_in_channels=expected_in_channels if keep_in is not None else None,
+                             keep_out_indices=keep_out.tolist() if keep_out is not None else None,
+                             keep_in_indices=keep_in.tolist() if keep_in is not None else None)
+
+    if new_out < old_out:
+        new_bn = _replace_bn(bn, new_out, keep_indices=keep_out.tolist())
+        conv_module.bn = new_bn
+
+    conv_module.conv = new_conv
+
+    return new_out if new_out < old_out else old_out
+
+
+def prune_c2f_module(c2f_module, pruning_ratio=0.3, expected_in_channels=None):
+    """
+    裁剪 C2f 模块
+    返回该模块的输出通道数
+    """
+    cv1 = c2f_module.cv1
+    cv2 = c2f_module.cv2
+    m = c2f_module.m
+    n = len(m)
+
+    old_cv1_out = cv1.conv.weight.shape[0]
+    c = old_cv1_out // 2
+
+    print(f"  C2f 原始通道: {c}, Bottleneck数量: {n}")
+
+    new_c = int(c * (1 - pruning_ratio))
+    new_c = max(new_c, 8)
+    new_c = (new_c // 8) * 8
+
+    if new_c >= c:
+        print(f"  ✗ 跳过 C2f: 新通道数 {new_c} >= 原始 {c}")
+        if expected_in_channels is not None:
+            prune_conv_module(cv1, pruning_ratio=0, expected_in_channels=expected_in_channels)
+        return cv2.conv.weight.shape[0]
+
+    # ========== 1. 处理 cv1 ==========
+    cv1_new_out = 2 * new_c
+
+    keep_out_cv1 = _get_important_channels(cv1.conv.weight.data, cv1_new_out, dim=0)
+    keep_in_cv1 = None
+    if expected_in_channels is not None:
+        cv1_old_in = cv1.conv.weight.shape[1]
+        if expected_in_channels != cv1_old_in:
+            keep_in_cv1 = _get_important_channels(cv1.conv.weight.data, expected_in_channels, dim=1)
+
+    new_cv1_conv = _replace_conv(cv1.conv, new_out_channels=cv1_new_out,
+                                 keep_out_indices=keep_out_cv1.tolist(),
+                                 keep_in_indices=keep_in_cv1.tolist() if keep_in_cv1 is not None else None)
+    new_cv1_bn = _replace_bn(cv1.bn, cv1_new_out, keep_indices=keep_out_cv1.tolist())
+    c2f_module.cv1.conv = new_cv1_conv
+    c2f_module.cv1.bn = new_cv1_bn
+
+    # ========== 2. 处理每个 Bottleneck ==========
+    for bottleneck in m:
+        if hasattr(bottleneck, 'cv1'):
+            old_w = bottleneck.cv1.conv.weight
+            keep_out = _get_important_channels(old_w.data, new_c, dim=0)
+            keep_in = _get_important_channels(old_w.data, new_c, dim=1)
+            new_conv = _replace_conv(bottleneck.cv1.conv, new_out_channels=new_c, new_in_channels=new_c,
+                                     keep_out_indices=keep_out.tolist(), keep_in_indices=keep_in.tolist())
+            new_bn = _replace_bn(bottleneck.cv1.bn, new_c, keep_indices=keep_out.tolist())
+            bottleneck.cv1.conv = new_conv
+            bottleneck.cv1.bn = new_bn
+
+        if hasattr(bottleneck, 'cv2'):
+            old_w = bottleneck.cv2.conv.weight
+            keep_out = _get_important_channels(old_w.data, new_c, dim=0)
+            keep_in = _get_important_channels(old_w.data, new_c, dim=1)
+            new_conv = _replace_conv(bottleneck.cv2.conv, new_out_channels=new_c, new_in_channels=new_c,
+                                     keep_out_indices=keep_out.tolist(), keep_in_indices=keep_in.tolist())
+            new_bn = _replace_bn(bottleneck.cv2.bn, new_c, keep_indices=keep_out.tolist())
+            bottleneck.cv2.conv = new_conv
+            bottleneck.cv2.bn = new_bn
+
+    # ========== 3. 处理 cv2 ==========
+    # YOLOv8 C2f: y = cv1(x).chunk(2,1) -> y[0](new_c), y[1](new_c)
+    # y.extend(m(y[-1]) for m in self.m) -> n个bottleneck，每个输出new_c
+    # concat: y[0] + y[1] + m[0] + ... + m[n-1] = (2 + n) * new_c
+    expected_cv2_in = (2 + n) * new_c
+    cv2_old_out = cv2.conv.weight.shape[0]
+
+    new_cv2_conv = nn.Conv2d(expected_cv2_in, cv2_old_out, kernel_size=1, stride=1, bias=False).to(cv2.conv.weight.device)
+    with torch.no_grad():
+        old_w = cv2.conv.weight.data  # [cv2_old_out, old_in, 1, 1]
+        new_cv2_conv.weight.normal_(0, 0.01)
+        out_copy = min(cv2_old_out, cv2_old_out)
+        in_copy = min(old_w.shape[1], expected_cv2_in)
+        new_cv2_conv.weight.data[:out_copy, :in_copy] = old_w[:out_copy, :in_copy]
+
+    c2f_module.cv2.conv = new_cv2_conv
+
+    # 更新属性
+    if hasattr(c2f_module, 'c'):
+        c2f_module.c = new_c
+
+    return cv2_old_out
+
+
+def prune_model_manual(model_path, pruning_ratio=0.3, img_size=640):
+    """
+    手动剪枝 YOLOv8 模型
+    """
+    from ultralytics import YOLO
+    import os
+
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model = YOLO(model_path)
+    detection_model = model.model.to(device).eval()
+
+    # 统计原始模型
+    example_inputs = torch.randn(1, 3, img_size, img_size).to(device)
+    original_params = sum(p.numel() for p in detection_model.parameters())
+    print(f"原始参数量: {original_params / 1e6:.2f}M")
+
+    try:
+        import torch_pruning as tp
+        original_flops, _ = tp.utils.count_ops_and_params(detection_model, example_inputs)
+        print(f"原始FLOPs: {original_flops / 1e9:.2f}G")
+    except Exception:
+        original_flops = None
+
+    print(f"\n开始手动剪枝，目标比例: {pruning_ratio}")
+
+    out_channels_map = {}
+    pruned_count = 0
+
+    for i, module in enumerate(detection_model.model):
+        name = f"model.{i}"
+        module_type = module.__class__.__name__
+
+        # 获取当前层的输入通道
+        if i == 0:
+            current_in = 3
+        else:
+            current_in = out_channels_map.get(i - 1, 3)
+
+            # 处理 Concat
+            if module_type == 'Concat':
+                concat_dims = []
+                if hasattr(module, 'f'):
+                    for idx in module.f:
+                        if isinstance(idx, int):
+                            if idx < 0:
+                                idx = i + idx
+                            concat_dims.append(out_channels_map.get(idx, 0))
+                total_out = sum(concat_dims)
+                out_channels_map[i] = total_out
+                print(f"  Concat {name}: 输入来自 {module.f}, 总通道 {total_out}")
+                continue
+
+            if module_type == 'Detect':
+                out_channels_map[i] = None
+                continue
+
+        # 跳过检测头
+        if module_type == 'Detect':
+            continue
+
+        # 处理 Conv
+        if module_type == 'Conv':
+            try:
+                new_out = prune_conv_module(module, pruning_ratio, expected_in_channels=current_in)
+                if new_out < module.conv.weight.shape[0]:
+                    print(f"  ✓ 剪枝 Conv: {name} (输出 {new_out})")
+                    pruned_count += 1
+                else:
+                    print(f"  → 保持 Conv: {name} (输出 {new_out})")
+                out_channels_map[i] = new_out
+            except Exception as e:
+                print(f"  ✗ 跳过 Conv: {name} ({e})")
+                out_channels_map[i] = module.conv.weight.shape[0]
+
+        # 处理 C2f
+        elif module_type == 'C2f':
+            try:
+                new_out = prune_c2f_module(module, pruning_ratio, expected_in_channels=current_in)
+                print(f"  ✓ 剪枝 C2f: {name} (输出 {new_out})")
+                pruned_count += 1
+                out_channels_map[i] = new_out
+            except Exception as e:
+                print(f"  ✗ 跳过 C2f: {name} ({e})")
+                if hasattr(module, 'cv2') and hasattr(module.cv2, 'conv'):
+                    out_channels_map[i] = module.cv2.conv.weight.shape[0]
+
+        # 处理 SPPF - 关键修复！
+        elif module_type == 'SPPF':
+            try:
+                # cv1: 输入对齐并裁剪
+                cv1_out = prune_conv_module(module.cv1, pruning_ratio, expected_in_channels=current_in)
+                # cv2: 输入是 cv1_out * 4（SPPF concat [x, y1, y2, y3] 共4个）
+                cv2_in = cv1_out * 4
+                cv2_out = prune_conv_module(module.cv2, pruning_ratio, expected_in_channels=cv2_in)
+                print(f"  ✓ 处理 SPPF: {name} (cv1={cv1_out}, cv2={cv2_out})")
+                pruned_count += 1
+                out_channels_map[i] = cv2_out
+            except Exception as e:
+                print(f"  ✗ 跳过 SPPF: {name} ({e})")
+                out_channels_map[i] = current_in
+
+        # 处理 Upsample
+        elif module_type == 'Upsample':
+            out_channels_map[i] = current_in
+
+        else:
+            out_channels_map[i] = current_in
+
+    print(f"\n剪枝完成: {pruned_count} 个模块被处理")
+
+    # 统计
+    pruned_params = sum(p.numel() for p in detection_model.parameters())
+    print(f"\n剪枝后参数量: {pruned_params / 1e6:.2f}M")
+
+    if original_flops is not None:
+        try:
+            pruned_flops, _ = tp.utils.count_ops_and_params(detection_model, example_inputs)
+            print(f"剪枝后FLOPs: {pruned_flops / 1e9:.2f}G")
+        except Exception as e:
+            print(f"FLOPs 统计失败: {e}")
+
+    if original_params > pruned_params:
+        print(f"✓ 压缩率: {original_params / pruned_params:.2f}x")
+    else:
+        print(f"✗ 警告: 参数量未减少")
+
+    # 验证
+    try:
+        with torch.no_grad():
+            out = detection_model(example_inputs)
+        print(f"✓ 输出形状验证通过")
+    except Exception as e:
+        print(f"✗ 输出验证失败: {e}")
+        raise
+
+    # 重置 BN
+    def reset_bn(model):
+        for m in model.modules():
+            if isinstance(m, nn.BatchNorm2d):
+                m.reset_running_stats()
+                m.momentum = 0.1
+
+    reset_bn(detection_model)
+
+    # 保存
+    os.makedirs('runs/prune', exist_ok=True)
+    model.model = detection_model
+    save_path = f'runs/prune/yolov8n_pruned_{int(pruning_ratio * 100)}.pt'
+    model.save(save_path)
+
+    print(f"\n模型已保存: {save_path}")
+
+    return model, original_params, pruned_params
+
+
+# 兼容旧接口
+def prune_model(model_path, pruning_ratio=0.3, img_size=640):
+    return prune_model_manual(model_path, pruning_ratio, img_size)
