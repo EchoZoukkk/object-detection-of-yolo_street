@@ -1,0 +1,28 @@
+# Copyright 2026 Zou Kaiyu
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+path: C:/Users/23564/Desktop/object_detection/data
+train: train2017/train2017    # 如果 train 也是同样结构
+val: val2017/val2017           # ← 修改这里！
+test: val2017/val2017
+
+names:
+  0: person
+  1: car
+  2: bus
+  3: truck
+  4: traffic_light
+  5: stop_sign
+  6: motorcycle
+  7: bicycle
+
+nc: 8
